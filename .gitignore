@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.env
+venv/
+.venv/
+
+# Generated data & model artifacts (regenerable; too large for git)
+data/
+*.npy
+*.npz
+*.pt
+*.safetensors
+results/checkpoints/
+
+# Keep these tracked:
+!results/plots/
+!results/*.csv
