@@ -4,6 +4,7 @@ transformers>=4.44
 datasets>=2.19
 accelerate>=0.30
 peft>=0.11           # LoRA adapters (used in the warm-start / RL phases)
+bitsandbytes>=0.43   # 4-bit loading for the (larger) teacher model
 
 # Numerics, data, plotting
 numpy>=1.24
