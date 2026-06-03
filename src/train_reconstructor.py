@@ -1,33 +1,24 @@
 """
 Step 3a of the NLA pipeline: train the RECONSTRUCTOR (English -> activation).
 
-Idea
-----
 The reconstructor reads a natural-language description and predicts the activation
-vector it corresponds to:
+vector it describes. Targets are z-scored per dimension (using TRAIN statistics) so
+every dimension contributes comparably; FVE is reported in this standardized space.
 
-    frozen base model (text encoder)  ->  small trainable MLP head  ->  activation
-
-Because the base model is frozen, we encode every summary ONCE into a feature
-vector, cache those, and train only the small MLP head. Fast and easy to iterate.
-
-Important detail: per-dimension standardization
-------------------------------------------------
-LLM residual streams contain a few "massive activation" dimensions whose values
-dwarf all others. If we just normalise each activation to unit norm, those few dims
-dominate and every target looks nearly identical -> almost no variance to explain ->
-FVE collapses to ~0. The raw text features have the same uneven scale, which also
-stalls optimisation. So we z-score BOTH features and targets per dimension (using
-training-set statistics). FVE is then reported in this standardized space: the
-average fraction of each dimension's variance that we recover. We also print
-diagnostics (variance concentration, a linear-regression baseline).
+Two modes (compare them in the README):
+  --mode frozen : freeze the base model, mean-pool its hidden states, train a small
+                  MLP head on those fixed features. Cheap baseline.
+  --mode lora   : let the transformer actually read the text. Fine-tune the base with
+                  LoRA adapters + a linear head on the last-token final hidden state,
+                  trained end-to-end. Much stronger, closer to the paper.
 
 Inputs : <data_dir>/activations.npy, <data_dir>/summaries.jsonl
-Outputs: <data_dir>/reconstructor.pt (head weights + standardization stats)
-         <data_dir>/split.json       (train/val indices, reused by later steps)
+Outputs: <data_dir>/reconstructor.pt          (head + standardization stats + meta)
+         <data_dir>/reconstructor_lora/        (LoRA adapter, lora mode only)
+         <data_dir>/split.json                 (train/val indices, reused later)
 
 Run:
-    python src/train_reconstructor.py --data_dir data --epochs 100
+    python src/train_reconstructor.py --data_dir data --mode lora --epochs 8
 """
 
 import argparse
@@ -36,6 +27,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import CONFIG
@@ -48,43 +40,37 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", default="data")
     p.add_argument("--model_name", default=CONFIG.model_name)
-    p.add_argument("--epochs", type=int, default=100)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--mode", choices=["frozen", "lora"], default="lora")
+    p.add_argument("--epochs", type=int, default=8)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--hidden", type=int, default=2048)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--max_len", type=int, default=160)
+    p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
 
 def standardize_stats(x):
-    """Per-dimension mean and (floored) std."""
     mean = x.mean(dim=0, keepdim=True)
     std = x.std(dim=0, keepdim=True)
-    floor = 1e-2 * std.median()
-    std = std.clamp(min=max(floor.item(), 1e-6))
-    return mean, std
+    floor = max((1e-2 * std.median()).item(), 1e-6)
+    return mean, std.clamp(min=floor)
 
 
-def ridge_baseline(Xtr, Ytr, Xva, Yva, lam=10.0):
-    """Closed-form ridge regression -> a quick 'is anything learnable?' ceiling."""
-    ones_tr = torch.ones(Xtr.shape[0], 1, device=Xtr.device)
-    ones_va = torch.ones(Xva.shape[0], 1, device=Xva.device)
-    Xb = torch.cat([Xtr, ones_tr], dim=1)
-    A = Xb.T @ Xb + lam * torch.eye(Xb.shape[1], device=Xb.device)
-    W = torch.linalg.solve(A, Xb.T @ Ytr)
-    pred_va = torch.cat([Xva, ones_va], dim=1) @ W
-    return compute_fve(pred_va, Yva)
+def last_token(hidden, attn):
+    idx = attn.sum(1) - 1
+    return hidden[torch.arange(hidden.shape[0], device=hidden.device), idx]
 
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
+    print(f"Device: {device} | mode: {args.mode}")
 
-    # --- Load activations and paired summaries ---
+    # --- Load activations + paired summaries ---
     activations = np.load(os.path.join(args.data_dir, "activations.npy")).astype(np.float32)
     rows = [json.loads(l) for l in open(os.path.join(args.data_dir, "summaries.jsonl"), encoding="utf-8")]
     idxs = [r["idx"] for r in rows]
@@ -92,26 +78,6 @@ def main():
     targets_raw = torch.tensor(activations[idxs], dtype=torch.float32)
     N, d = targets_raw.shape
     print(f"{N} paired examples, activation dim {d}.")
-
-    # --- Diagnostic: how concentrated is the activation variance? ---
-    var_per_dim = targets_raw.var(dim=0)
-    total_var = var_per_dim.sum().item()
-    top1 = var_per_dim.max().item() / total_var
-    top5 = var_per_dim.topk(5).values.sum().item() / total_var
-    print(f"[diag] variance share -> top-1 dim: {top1:.1%}, top-5 dims: {top5:.1%}")
-    print(f"[diag] max |mean| over dims: {targets_raw.mean(0).abs().max().item():.1f}")
-
-    # --- Encode all summaries once with the frozen base model ---
-    print("Loading frozen encoder and extracting text features (one-time)...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    base = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    ).to(device)
-    base.eval()
-    feats = encode_texts(base, tokenizer, texts, device)   # (N, d) CPU tensor
 
     # --- Train / val split (saved for reuse) ---
     perm = np.random.permutation(N)
@@ -121,44 +87,98 @@ def main():
         json.dump({"train_idx": [int(idxs[i]) for i in train_pos],
                    "val_idx": [int(idxs[i]) for i in val_pos]}, f)
 
-    # --- Standardize features and targets using TRAIN stats only ---
-    fmean, fstd = standardize_stats(feats[train_pos])
+    # --- Standardize targets using TRAIN stats ---
     tmean, tstd = standardize_stats(targets_raw[train_pos])
-    X = ((feats - fmean) / fstd).to(device)
-    Y = ((targets_raw - tmean) / tstd).to(device)
-    Xtr, Ytr = X[train_pos], Y[train_pos]
-    Xva, Yva = X[val_pos], Y[val_pos]
+    Y = ((targets_raw - tmean) / tstd)
+    Ytr_cpu, Yva_cpu = Y[train_pos], Y[val_pos]
+    texts_tr = [texts[i] for i in train_pos]
+    texts_va = [texts[i] for i in val_pos]
 
-    # --- Linear baseline (sanity ceiling) ---
-    lin_fve = ridge_baseline(Xtr, Ytr, Xva, Yva)
-    print(f"[diag] ridge linear baseline val FVE: {lin_fve:.3f}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    # --- Train the MLP head ---
-    head = ReconstructorHead(d, d, hidden=args.hidden).to(device)
-    opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    best_fve, bs = -1e9, 128
+    if args.mode == "frozen":
+        # ---- Baseline: frozen encoder + MLP head on cached mean-pooled features ----
+        base = AutoModelForCausalLM.from_pretrained(
+            args.model_name, torch_dtype=torch.float16 if device == "cuda" else torch.float32).to(device)
+        base.eval()
+        feats = encode_texts(base, tokenizer, texts, device)
+        fmean, fstd = standardize_stats(feats[train_pos])
+        X = ((feats - fmean) / fstd).to(device)
+        Xtr, Xva = X[train_pos], X[val_pos]
+        Ytr, Yva = Y[train_pos].to(device), Y[val_pos].to(device)
+
+        head = ReconstructorHead(d, d, hidden=args.hidden).to(device)
+        opt = torch.optim.AdamW(head.parameters(), lr=1e-3, weight_decay=args.weight_decay)
+        best = -1e9
+        for epoch in range(max(args.epochs, 60)):
+            head.train(); order = torch.randperm(Xtr.shape[0], device=device)
+            for i in range(0, Xtr.shape[0], 128):
+                sel = order[i:i + 128]
+                loss = ((head(Xtr[sel]) - Ytr[sel]) ** 2).sum(1).mean()
+                opt.zero_grad(); loss.backward(); opt.step()
+            head.eval()
+            with torch.no_grad():
+                fve_va = compute_fve(head(Xva), Yva)
+            best = max(best, fve_va)
+        print(f"\n[frozen baseline] best val FVE: {best:.3f}")
+        return
+
+    # ---- Main: LoRA end-to-end ----
+    from peft import LoraConfig, get_peft_model
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name, torch_dtype=torch.float32).to(device)
+    lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
+                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+                      task_type="CAUSAL_LM")
+    model = get_peft_model(model, lora)
+    model.print_trainable_parameters()
+    head = nn.Linear(d, d).to(device)
+
+    params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
+
+    def encode_batch(texts_b):
+        return tokenizer(list(texts_b), return_tensors="pt", padding=True,
+                         truncation=True, max_length=args.max_len).to(device)
+
+    @torch.no_grad()
+    def eval_fve(texts_e, Y_cpu):
+        model.eval(); head.eval(); preds = []
+        for i in range(0, len(texts_e), args.batch_size):
+            enc = encode_batch(texts_e[i:i + args.batch_size])
+            h = last_token(model(**enc, output_hidden_states=True).hidden_states[-1], enc["attention_mask"])
+            preds.append(head(h.float()).cpu())
+        return compute_fve(torch.cat(preds), Y_cpu)
+
+    best = -1e9
+    n_tr = len(texts_tr)
     for epoch in range(args.epochs):
-        head.train()
-        order = torch.randperm(Xtr.shape[0], device=device)
-        for i in range(0, Xtr.shape[0], bs):
-            sel = order[i:i + bs]
-            loss = ((head(Xtr[sel]) - Ytr[sel]) ** 2).sum(dim=1).mean()
+        model.train(); head.train()
+        order = np.random.permutation(n_tr)
+        running = 0.0
+        for i in range(0, n_tr, args.batch_size):
+            sel = order[i:i + args.batch_size]
+            enc = encode_batch([texts_tr[j] for j in sel])
+            h = last_token(model(**enc, output_hidden_states=True).hidden_states[-1], enc["attention_mask"])
+            pred = head(h.float())
+            tgt = Ytr_cpu[sel].to(device)
+            loss = ((pred - tgt) ** 2).sum(1).mean()
             opt.zero_grad(); loss.backward(); opt.step()
-        head.eval()
-        with torch.no_grad():
-            fve_tr = compute_fve(head(Xtr), Ytr)
-            fve_va = compute_fve(head(Xva), Yva)
-        if fve_va > best_fve:
-            best_fve = fve_va
-            torch.save({"head": head.state_dict(), "d": d, "hidden": args.hidden,
-                        "wrap": WRAP, "model_name": args.model_name,
-                        "fmean": fmean, "fstd": fstd, "tmean": tmean, "tstd": tstd},
+            running += loss.item()
+        fve_va = eval_fve(texts_va, Yva_cpu)
+        fve_tr = eval_fve(texts_tr[:500], Ytr_cpu[:500])
+        print(f"epoch {epoch} | train-FVE(500) {fve_tr:.3f} | val FVE {fve_va:.3f} | loss {running:.1f}")
+        if fve_va > best:
+            best = fve_va
+            model.save_pretrained(os.path.join(args.data_dir, "reconstructor_lora"))
+            torch.save({"head": head.state_dict(), "d": d, "wrap": WRAP, "mode": "lora",
+                        "model_name": args.model_name, "tmean": tmean, "tstd": tstd},
                        os.path.join(args.data_dir, "reconstructor.pt"))
-        if epoch % 10 == 0 or epoch == args.epochs - 1:
-            print(f"epoch {epoch:3d} | train FVE {fve_tr:.3f} | val FVE {fve_va:.3f}")
 
-    print(f"\nBest validation FVE (oracle text): {best_fve:.3f}")
-    print(f"Saved reconstructor to {args.data_dir}/reconstructor.pt")
+    print(f"\nBest validation FVE (oracle text, LoRA): {best:.3f}")
+    print(f"Saved reconstructor to {args.data_dir}/reconstructor.pt (+ reconstructor_lora/)")
 
 
 if __name__ == "__main__":
