@@ -41,12 +41,15 @@ def parse_args():
     p.add_argument("--data_dir", default="data")
     p.add_argument("--model_name", default=CONFIG.model_name)
     p.add_argument("--mode", choices=["frozen", "lora"], default="lora")
-    p.add_argument("--epochs", type=int, default=8)
-    p.add_argument("--lr", type=float, default=2e-4)
-    p.add_argument("--hidden", type=int, default=2048)
+    p.add_argument("--epochs", type=int, default=12)
+    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--lora_r", type=int, default=32)
+    p.add_argument("--head_hidden", type=int, default=1024)
+    p.add_argument("--hidden", type=int, default=2048)  # used by frozen mode
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_len", type=int, default=160)
     p.add_argument("--batch_size", type=int, default=16)
+    p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
@@ -129,12 +132,18 @@ def main():
     from peft import LoraConfig, get_peft_model
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.float32).to(device)
-    lora = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, bias="none",
-                      target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-                      task_type="CAUSAL_LM")
+    lora = LoraConfig(
+        r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.05, bias="none",
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        task_type="CAUSAL_LM",
+    )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
-    head = nn.Linear(d, d).to(device)
+    head = nn.Sequential(
+        nn.Linear(d, args.head_hidden), nn.GELU(),
+        nn.Linear(args.head_hidden, d),
+    ).to(device)
 
     params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
@@ -165,7 +174,9 @@ def main():
             pred = head(h.float())
             tgt = Ytr_cpu[sel].to(device)
             loss = ((pred - tgt) ** 2).sum(1).mean()
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, args.grad_clip)
+            opt.step()
             running += loss.item()
         fve_va = eval_fve(texts_va, Yva_cpu)
         fve_tr = eval_fve(texts_tr[:500], Ytr_cpu[:500])
