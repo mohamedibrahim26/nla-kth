@@ -49,7 +49,7 @@ def parse_args():
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--max_len", type=int, default=160)
     p.add_argument("--batch_size", type=int, default=16)
-    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--grad_clip", type=float, default=100.0)  # effectively off; sum-loss has large grads
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
