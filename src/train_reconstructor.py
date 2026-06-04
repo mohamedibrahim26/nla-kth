@@ -39,6 +39,7 @@ WRAP = "A language model's internal state is described as follows: {s}"
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", default="data")
+    p.add_argument("--output_dir", default=None, help="If set, writes outputs here instead of data_dir.")
     p.add_argument("--model_name", default=CONFIG.model_name)
     p.add_argument("--mode", choices=["frozen", "lora"], default="lora")
     p.add_argument("--epochs", type=int, default=12)
@@ -86,7 +87,9 @@ def main():
     perm = np.random.permutation(N)
     n_val = int(N * args.val_frac)
     val_pos, train_pos = perm[:n_val], perm[n_val:]
-    with open(os.path.join(args.data_dir, "split.json"), "w") as f:
+    out_dir = args.output_dir or args.data_dir
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, "split.json"), "w") as f:
         json.dump({"train_idx": [int(idxs[i]) for i in train_pos],
                    "val_idx": [int(idxs[i]) for i in val_pos]}, f)
 
@@ -180,10 +183,10 @@ def main():
         print(f"epoch {epoch} | train-FVE(500) {fve_tr:.3f} | val FVE {fve_va:.3f} | loss {running:.1f}")
         if fve_va > best:
             best = fve_va
-            model.save_pretrained(os.path.join(args.data_dir, "reconstructor_lora"))
+            model.save_pretrained(os.path.join(args.output_dir or args.data_dir, "reconstructor_lora"))
             torch.save({"head": head.state_dict(), "d": d, "wrap": WRAP, "mode": "lora",
                         "model_name": args.model_name, "tmean": tmean, "tstd": tstd},
-                       os.path.join(args.data_dir, "reconstructor.pt"))
+                       os.path.join(args.output_dir or args.data_dir, "reconstructor.pt"))
 
     print(f"\nBest validation FVE (oracle text, LoRA): {best:.3f}")
     print(f"Saved reconstructor to {args.data_dir}/reconstructor.pt (+ reconstructor_lora/)")
