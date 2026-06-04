@@ -1,0 +1,7 @@
+{
+  "fve_generated_text": 0.030313968658447266,
+  "fve_oracle_text": 0.04993969202041626,
+  "fve_random_text": -0.06536567211151123,
+  "fve_predict_mean": 0.0,
+  "n_val": 400
+}
