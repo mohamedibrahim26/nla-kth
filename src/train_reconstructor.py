@@ -42,7 +42,7 @@ def parse_args():
     p.add_argument("--model_name", default=CONFIG.model_name)
     p.add_argument("--mode", choices=["frozen", "lora"], default="lora")
     p.add_argument("--epochs", type=int, default=12)
-    p.add_argument("--lr", type=float, default=5e-4)
+    p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--lora_r", type=int, default=32)
     p.add_argument("--head_hidden", type=int, default=1024)
     p.add_argument("--hidden", type=int, default=2048)  # used by frozen mode
@@ -140,10 +140,7 @@ def main():
     )
     model = get_peft_model(model, lora)
     model.print_trainable_parameters()
-    head = nn.Sequential(
-        nn.Linear(d, args.head_hidden), nn.GELU(),
-        nn.Linear(args.head_hidden, d),
-    ).to(device)
+    head = nn.Linear(d, d).to(device)  # simpler head; the bigger LoRA carries capacity
 
     params = [p for p in model.parameters() if p.requires_grad] + list(head.parameters())
     opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay)
