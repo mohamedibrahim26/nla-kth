@@ -1,0 +1,12 @@
+{
+  "n_val": 400,
+  "fve_original_generated": 0.030313968658447266,
+  "fve_paraphrased": 0.03153806924819946,
+  "fve_sentence_shuffled": 0.03013366460800171,
+  "fve_word_shuffled": 0.02467435598373413,
+  "interpretation": {
+    "fve_orig_vs_paraphrase_ratio": 1.0403807433973542,
+    "small_drop_from_paraphrase_means": "bottleneck carries SEMANTIC content (not steganography)",
+    "big_drop_from_word_shuffle_means": "metric is sensitive to text structure (sanity check)"
+  }
+}
