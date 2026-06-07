@@ -34,27 +34,25 @@ def parse_args():
 
 
 def plot_fve_bar(data_dir, out_dir):
-    """Bar chart of every FVE condition we measured."""
+    """Bar chart of every FVE condition we measured, ordered to match the README table."""
+    nla_path = os.path.join(data_dir, "nla_results.json")
+    para_path = os.path.join(data_dir, "paraphrase_results.json")
+    nla = json.load(open(nla_path)) if os.path.exists(nla_path) else None
+    para = json.load(open(para_path)) if os.path.exists(para_path) else None
+
     bars = []
-    nla = os.path.join(data_dir, "nla_results.json")
-    if os.path.exists(nla):
-        r = json.load(open(nla))
-        bars += [
-            ("Oracle text\n(teacher summary)", r["fve_oracle_text"], "#3b82f6"),
-            ("Generated text\n(verbalizer NLA)", r["fve_generated_text"], "#10b981"),
-            ("Predict mean\n(baseline)", r["fve_predict_mean"], "#a3a3a3"),
-            ("Random text\n(shuffled summary)", r["fve_random_text"], "#ef4444"),
-        ]
-    para = os.path.join(data_dir, "paraphrase_results.json")
-    if os.path.exists(para):
-        r = json.load(open(para))
-        # Insert the paraphrase condition right after generated, and the shuffles
-        bars.insert(2, ("Paraphrased\n(meaning preserved)",
-                        r["fve_paraphrased"], "#06b6d4"))
-        bars += [
-            ("Sentence-shuffled\ngenerated", r["fve_sentence_shuffled"], "#f59e0b"),
-            ("Word-shuffled\ngenerated", r["fve_word_shuffled"], "#dc2626"),
-        ]
+    if nla:
+        bars.append(("Oracle text\n(teacher summary)", nla["fve_oracle_text"], "#3b82f6"))
+    if para:
+        bars.append(("Paraphrased\n(meaning preserved)", para["fve_paraphrased"], "#06b6d4"))
+    if nla:
+        bars.append(("Generated text\n(verbalizer NLA)", nla["fve_generated_text"], "#10b981"))
+    if para:
+        bars.append(("Sentence-shuffled\ngenerated", para["fve_sentence_shuffled"], "#f59e0b"))
+        bars.append(("Word-shuffled\ngenerated", para["fve_word_shuffled"], "#dc2626"))
+    if nla:
+        bars.append(("Predict mean\n(baseline)", nla["fve_predict_mean"], "#a3a3a3"))
+        bars.append(("Random text\n(shuffled summary)", nla["fve_random_text"], "#ef4444"))
 
     labels = [b[0] for b in bars]
     values = [b[1] for b in bars]
