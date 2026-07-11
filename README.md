@@ -54,7 +54,7 @@ Training is standard next-token cross-entropy against the teacher summaries. Thi
 
 Three epochs, batch size 4, learning rate 2e-4. Best validation cross-entropy was **1.46** at epoch 1, which is a perplexity of about 4.3. The random baseline for this vocabulary is about 12, so the verbalizer is actually predicting teacher-style tokens, not noise.
 
-### 4.3 RL phase — GRPO (Group Relative Policy Optimization)
+### 4.3 RL phase: GRPO (Group Relative Policy Optimization)
 
 Code: [`src/train_rl_verbalizer.py`](src/train_rl_verbalizer.py).
 
@@ -285,9 +285,9 @@ Everything else (`--lr`, `--lora_r`, `--max_len`, and so on) is exposed as a CLI
 
 ## 10. What I would do next with more time
 
-There are no remaining low-hanging extensions — the core pipeline (warm-start, RL, layer ablation) is complete. The natural next step is a domain transfer: apply the same pipeline to a code model to ask whether the NLA bottleneck carries bug-semantic content. That extension is implemented in section 11.
+The most natural extension is applying this pipeline to a code model to ask whether the NLA bottleneck carries bug-semantic content. That work is fully implemented in section 11. Beyond that, the highest-impact remaining improvements would be: using a frontier API teacher rather than Qwen2.5-3B for sharper warm-start summaries, running more GRPO steps to further close the Generated-to-Oracle FVE gap, and repeating the layer ablation across multiple model sizes to understand how scale and depth interact with the quality of the bottleneck.
 
-## 11. Code-model extension — does the NLA bottleneck detect bugs?
+## 11. Code-model extension: does the NLA bottleneck detect bugs?
 
 This section applies the NLA pipeline to `Qwen2.5-Coder-0.5B` to answer a concrete research question: **does the verbalizer's English description shift in a measurable way when the model reads buggy code versus correct code?**
 
