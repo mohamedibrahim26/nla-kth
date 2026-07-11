@@ -90,10 +90,13 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Use bfloat16 on CUDA to halve VRAM usage
+    model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+
     # --- Load RECONSTRUCTOR (base + LoRA + head + stats) ---
     print("Loading reconstructor...")
     base_r = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float32).to(device)
+        args.model_name, torch_dtype=model_dtype).to(device)
     recon_model = PeftModel.from_pretrained(base_r, os.path.join(out_dir, "reconstructor_lora")).to(device)
     recon_model.eval()
     recon_pt = torch.load(os.path.join(out_dir, "reconstructor.pt"), map_location=device)
@@ -139,7 +142,7 @@ def main():
     print("Loading verbalizer...")
     vp = torch.load(args.verbalizer_pt, map_location=device)
     base_v = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float32).to(device)
+        args.model_name, torch_dtype=model_dtype).to(device)
     verb_model = PeftModel.from_pretrained(base_v, args.verbalizer_lora).to(device)
     verb_model.eval()
     projection = nn.Linear(vp["act_dim"], vp["embed_dim"]).to(device)
@@ -179,7 +182,7 @@ def main():
     del verb_model, base_v, projection, embed_layer
     torch.cuda.empty_cache()
     base_r = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float32).to(device)
+        args.model_name, torch_dtype=model_dtype).to(device)
     recon_model = PeftModel.from_pretrained(base_r, os.path.join(out_dir, "reconstructor_lora")).to(device)
     recon_model.eval()
 

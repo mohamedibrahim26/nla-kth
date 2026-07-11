@@ -72,7 +72,9 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device} | mode: {args.mode}")
+    # Use bfloat16 on CUDA to halve VRAM usage; fall back to float32 on CPU
+    model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    print(f"Device: {device} | mode: {args.mode} | dtype: {model_dtype}")
 
     # --- Load activations + paired summaries ---
     activations = np.load(os.path.join(args.data_dir, "activations.npy")).astype(np.float32)
@@ -133,8 +135,9 @@ def main():
 
     # ---- Main: LoRA end-to-end ----
     from peft import LoraConfig, get_peft_model
+    # bfloat16 cuts VRAM roughly in half vs float32 with no training instability on Ampere+ GPUs
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_name, torch_dtype=torch.float32).to(device)
+        args.model_name, torch_dtype=model_dtype).to(device)
     lora = LoraConfig(
         r=args.lora_r, lora_alpha=2 * args.lora_r, lora_dropout=0.05, bias="none",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
@@ -171,7 +174,7 @@ def main():
             sel = order[i:i + args.batch_size]
             enc = encode_batch([texts_tr[j] for j in sel])
             h = last_token(model(**enc, output_hidden_states=True).hidden_states[-1], enc["attention_mask"])
-            pred = head(h.float())
+            pred = head(h.float())  # cast to fp32 for stable loss computation
             tgt = Ytr_cpu[sel].to(device)
             loss = ((pred - tgt) ** 2).sum(1).mean()
             opt.zero_grad(); loss.backward()
