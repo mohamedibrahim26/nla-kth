@@ -72,8 +72,8 @@ def main():
     args = parse_args()
     torch.manual_seed(args.seed); np.random.seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    # Use bfloat16 on CUDA to halve VRAM usage; fall back to float32 on CPU
-    model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # float32: universally supported on T4 (sm_75); 0.5B model = ~2GB VRAM, well within 16GB
+    model_dtype = torch.float32
     print(f"Device: {device} | mode: {args.mode} | dtype: {model_dtype}")
 
     # --- Load activations + paired summaries ---

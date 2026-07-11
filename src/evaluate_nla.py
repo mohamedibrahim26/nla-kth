@@ -90,8 +90,8 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Use bfloat16 on CUDA to halve VRAM usage
-    model_dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # float32: universally supported on T4 (sm_75); 0.5B model = ~2GB VRAM, well within 16GB
+    model_dtype = torch.float32
 
     # --- Load RECONSTRUCTOR (base + LoRA + head + stats) ---
     print("Loading reconstructor...")
