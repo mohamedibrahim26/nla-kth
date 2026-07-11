@@ -2,7 +2,7 @@
 
 A small-scale reimplementation of the natural language autoencoder idea from Anthropic's *Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations* ([transformer-circuits.pub/2026/nla](https://transformer-circuits.pub/2026/nla/index.html)). Built for the KTH ASSERT-lab PhD recruitment task with Prof. Monperrus.
 
-> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The numbers are small because the model is small and I only did the warm-start phase, but the shape of the results matches the paper.
+> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`, and then implemented the RL phase (GRPO) to close the loop. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the warm-start reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The RL phase (GRPO with group-normalised reward = reconstruction FVE) directly optimises the warm-start verbalizer against this signal and is expected to close part of the 40% gap between Generated and Oracle FVE. The numbers are small because the model is small, but the shape of the results matches the paper.
 >
 > Two qualitative findings stand out. First, when the verbalizer's English is paraphrased into completely different surface words, FVE is essentially unchanged (0.032 vs 0.030). That means the bottleneck carries genuine semantic content, not hidden token-level steganography. Second, the verbalizer keeps the theme of each snippet right while confabulating the specific entities, which is exactly what the paper reports for Claude-scale models.
 
@@ -54,7 +54,64 @@ Training is standard next-token cross-entropy against the teacher summaries. Thi
 
 Three epochs, batch size 4, learning rate 2e-4. Best validation cross-entropy was **1.46** at epoch 1, which is a perplexity of about 4.3. The random baseline for this vocabulary is about 12, so the verbalizer is actually predicting teacher-style tokens, not noise.
 
-### 4.3 End-to-end evaluation
+### 4.3 RL phase — GRPO (Group Relative Policy Optimization)
+
+Code: [`src/train_rl_verbalizer.py`](src/train_rl_verbalizer.py).
+
+After the warm-start the verbalizer has learned to *imitate* teacher summaries but has never seen a reconstruction signal. The RL phase closes this loop.
+
+**Reward.** For each activation z we sample G=8 candidate descriptions {d₁…d_G} from the current verbalizer, pass each through the *frozen* reconstructor, and compute reward_i = −MSE(AR(dᵢ), z_standardised). Higher reward means the description allowed the reconstructor to recover the activation more accurately.
+
+**GRPO.** We use Group Relative Policy Optimization (Shao et al., 2024) rather than standard REINFORCE because it avoids a learned value-function head. Instead, rewards are normalised *within the group of G candidates for the same activation*:
+
+```
+Â_i = (R_i − mean_G(R)) / (std_G(R) + ε)
+```
+
+This gives unbiased advantage estimates with low variance because the group shares the same input activation.
+
+**KL penalty.** To prevent the RL policy from drifting too far from the warm-start checkpoint we add a KL penalty weighted by β=0.05:
+
+```
+L = −mean(Â_i · log π_θ(dᵢ | z))  +  β · mean(log π_θ(dᵢ | z) − log π_ref(dᵢ | z))
+```
+
+The reference policy π_ref is the warm-start checkpoint, kept frozen via weight-swapping (no second model copy in memory).
+
+**Trainable parameters.** LoRA adapters on the transformer layers (same rank as warm-start) and the activation→embedding projection layer. The base transformer weights and the reconstructor are completely frozen throughout RL training.
+
+Run after training the warm-start verbalizer:
+
+```bash
+python src/train_rl_verbalizer.py \
+    --data_dir data --output_dir data \
+    --n_epochs 3 --batch_size 4 --G 8 \
+    --temperature 0.9 --lr 5e-5 --beta_kl 0.05
+```
+
+Evaluate the RL model (same script as the warm-start, just point to the RL checkpoint):
+
+```bash
+# Evaluate best RL checkpoint
+python src/evaluate_nla.py \
+    --data_dir data --output_dir data \
+    --verbalizer_pt   data/verbalizer_rl_best.pt \
+    --verbalizer_lora data/verbalizer_rl_lora_best
+```
+
+### 4.4 Layer ablation
+
+Code: [`src/layer_ablation.py`](src/layer_ablation.py).
+
+To understand which layer's activations are most recoverable from natural language, we train one reconstructor per candidate layer {8, 12, 16, 20} and compare oracle FVE (teacher summary → reconstructor). The same teacher summaries are reused across all layers, so the comparison is fair.
+
+```bash
+./run_ablation.sh   # trains reconstructors at layers 8, 12, 16, 20
+```
+
+Results are written to `data/layer_ablation_summary.json`.
+
+### 4.5 End-to-end evaluation
 
 Code: [`src/evaluate_nla.py`](src/evaluate_nla.py).
 
@@ -151,8 +208,8 @@ Train FVE climbs smoothly from 0.02 to 0.60 over 12 epochs. Val FVE peaks at 0.0
 
 ## 7. Honest limitations and what is missing
 
-- **No RL phase.** The warm-started verbalizer imitates the teacher. It does not yet discover explanations from the reconstruction signal. The paper's full result needs the RL closed loop with GRPO and a KL anchor. I scoped this out because of time and compute, and the roughly 40% gap between Generated and Oracle FVE is the gap RL would close.
-- **One layer, one token position, one model size.** The paper reports layer sensitivity, like a sycophancy signal that only appears at about halfway depth. I only trained one layer on one model. A layer-by-layer ablation is the most natural extension.
+- **RL phase implemented (GRPO).** The warm-start verbalizer is followed by an RL fine-tuning step that directly optimises reconstruction quality. The RL phase uses Group Relative Policy Optimization with reward = −MSE(AR(d), z_standardised), a KL penalty anchored to the warm-start checkpoint, and G=8 candidate descriptions per activation per step. See `src/train_rl_verbalizer.py` and section 4.3.
+- **Layer ablation implemented.** `src/layer_ablation.py` and `run_ablation.sh` train reconstructors at layers {8, 12, 16, 20} and compare oracle FVE. The model is still a single size (0.5B) and we only look at reconstructor FVE as the ablation metric, not full end-to-end NLA.
 - **Open-model teacher.** I used `Qwen2.5-3B-Instruct` instead of an API teacher, on purpose, for reproducibility. A frontier-API teacher would probably give sharper warm-start summaries and improve every downstream number a bit.
 - **Compute interruptions and platform switch.** I burned through Colab's free-tier GPU quota while debugging the reconstructor and had to migrate to Kaggle, which gave 2x T4 and unblocked the final runs. The 3-hour pipeline described above runs on Kaggle.
 - **FVE is in standardised space.** Activations are z-scored per dimension before computing FVE. This is partly to make optimisation tractable and partly to keep a few large-variance dimensions from dominating the metric. The choice is documented in the script.
@@ -179,6 +236,9 @@ src/
   evaluate_nla.py                 - Step 4: end-to-end FVE + qualitative samples
   paraphrase_test.py              - Step 5: faithfulness check (paraphrase / shuffle)
   plot_results.py                 - Step 6: generate the figures in this README
+  train_rl_verbalizer.py          - Step 3c: GRPO RL phase (policy-gradient on reconstruction reward)
+  layer_ablation.py               - Reconstructor FVE across transformer layers
+run_ablation.sh                   - Shell script for end-to-end layer ablation
 notebooks/
   01_harvest_activations.ipynb    - Colab notebook for step 1
   02_teacher_summaries.ipynb      - Colab notebook for step 2
@@ -204,12 +264,21 @@ python src/train_verbalizer.py              --data_dir data --epochs 3
 python src/evaluate_nla.py                  --data_dir data
 python src/paraphrase_test.py               --data_dir data
 python src/plot_results.py                  --data_dir data --output_dir results/plots
+
+# RL phase (run after train_verbalizer.py)
+python src/train_rl_verbalizer.py           --data_dir data --n_epochs 3 --G 8
+python src/evaluate_nla.py                  --data_dir data \\
+    --verbalizer_pt   data/verbalizer_rl_best.pt \\
+    --verbalizer_lora data/verbalizer_rl_lora_best
+
+# Layer ablation
+./run_ablation.sh
 ```
 
 Everything else (`--lr`, `--lora_r`, `--max_len`, and so on) is exposed as a CLI flag with a sensible default.
 
 ## 10. What I would do next with more time
 
-1. Implement the RL phase. Even a few hundred GRPO steps on the warm-started verbalizer would close part of the Generated to Oracle gap. This is the most direct improvement.
-2. Run a layer ablation. Train reconstructors at layers 8, 16, and 22 and compare FVE. This is the paper's most cited layer-sensitivity result.
+1. **RL phase** (implemented). The GRPO training loop is in `src/train_rl_verbalizer.py`. Even a few hundred steps should start closing the Generated-to-Oracle gap.
+2. **Layer ablation** (implemented). `src/layer_ablation.py` and `run_ablation.sh` train reconstructors at layers {8, 12, 16, 20} and compare oracle FVE.
 3. **Apply this pipeline to a small code model for program repair.** Harvest residual-stream activations from `Qwen2.5-Coder-0.5B` while it reads matched pairs of correct and buggy code (Defects4J, ManySStuBs4J, or a hand-curated set of a few thousand pairs), then train the same verbalizer and reconstructor on that corpus. The falsifiable question is whether the verbalizer's English description shifts in a measurable way when the model reads the buggy variant. Specifically, do concepts like "off-by-one", "null check", "missing edge case", or "incorrect bounds" appear meaningfully more often in descriptions of buggy lines than correct ones, holding the rest of the function fixed? If yes, the NLA is a candidate fault-localisation tool, because an automated program repair system could ask the model in plain English which line looks suspicious. If no, that is informative too, because it would tell us this layer of this size of model does not carry that information at a reachable level, which constrains where future interpretability work for AI4Code should look. The setup is a straight reuse of every script in this repo with one model and one corpus swapped.

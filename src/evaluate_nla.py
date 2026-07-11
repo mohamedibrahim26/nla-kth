@@ -45,6 +45,12 @@ def parse_args():
     p.add_argument("--batch_size_eval", type=int, default=8)
     p.add_argument("--max_len_recon", type=int, default=200)
     p.add_argument("--n_qualitative", type=int, default=20)
+    p.add_argument("--verbalizer_pt",   default=None,
+                   help="path to verbalizer .pt file (default: <output_dir>/verbalizer.pt); "
+                        "set to data/verbalizer_rl_best.pt to evaluate the RL model")
+    p.add_argument("--verbalizer_lora",  default=None,
+                   help="path to verbalizer LoRA dir (default: <output_dir>/verbalizer_lora); "
+                        "set to data/verbalizer_rl_lora_best to evaluate the RL model")
     return p.parse_args()
 
 
@@ -58,7 +64,10 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     out_dir = args.output_dir or args.data_dir
     os.makedirs(out_dir, exist_ok=True)
+    if args.verbalizer_pt   is None: args.verbalizer_pt   = os.path.join(out_dir, "verbalizer.pt")
+    if args.verbalizer_lora is None: args.verbalizer_lora = os.path.join(out_dir, "verbalizer_lora")
     print(f"Device: {device}")
+    print(f"Verbalizer: {args.verbalizer_pt}  |  {args.verbalizer_lora}")
 
     # --- Load data + split ---
     activations = np.load(os.path.join(args.data_dir, "activations.npy")).astype(np.float32)
@@ -128,10 +137,10 @@ def main():
 
     # --- Load VERBALIZER (base + LoRA + projection) ---
     print("Loading verbalizer...")
-    vp = torch.load(os.path.join(out_dir, "verbalizer.pt"), map_location=device)
+    vp = torch.load(args.verbalizer_pt, map_location=device)
     base_v = AutoModelForCausalLM.from_pretrained(
         args.model_name, torch_dtype=torch.float32).to(device)
-    verb_model = PeftModel.from_pretrained(base_v, os.path.join(out_dir, "verbalizer_lora")).to(device)
+    verb_model = PeftModel.from_pretrained(base_v, args.verbalizer_lora).to(device)
     verb_model.eval()
     projection = nn.Linear(vp["act_dim"], vp["embed_dim"]).to(device)
     projection.load_state_dict(vp["projection"])
