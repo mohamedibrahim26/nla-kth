@@ -238,7 +238,12 @@ src/
   plot_results.py                 - Step 6: generate the figures in this README
   train_rl_verbalizer.py          - Step 3c: GRPO RL phase (policy-gradient on reconstruction reward)
   layer_ablation.py               - Reconstructor FVE across transformer layers
+  bug_injection.py                - AST-based synthetic bug injector (section 11)
+  harvest_code_activations.py     - Harvest Qwen2.5-Coder-0.5B activations on bug/fix pairs (section 11)
+  generate_code_teacher_summaries.py - Teacher summaries for code snippets (section 11)
+  analyze_bug_descriptions.py     - Keyword shift + FVE analysis for bug detection (section 11)
 run_ablation.sh                   - Shell script for end-to-end layer ablation
+run_code_analysis.sh              - Shell script for end-to-end code bug analysis (section 11)
 notebooks/
   01_harvest_activations.ipynb    - Colab notebook for step 1
   02_teacher_summaries.ipynb      - Colab notebook for step 2
@@ -251,6 +256,7 @@ results/
   paraphrase_samples.csv          - original / paraphrased / shuffled side by side
   plots/fve_bar.png               - all-condition FVE bar chart (section 5)
   plots/reconstructor_curve.png   - reconstructor training curve (section 6.5)
+  bug_analysis.json               - keyword shift + FVE results for code extension (section 11)
 ```
 
 End-to-end reproduction (on Kaggle, 2x T4, about 3 hours total):
@@ -279,4 +285,55 @@ Everything else (`--lr`, `--lora_r`, `--max_len`, and so on) is exposed as a CLI
 
 ## 10. What I would do next with more time
 
-1. **Apply this pipeline to a small code model for program repair.** Harvest residual-stream activations from `Qwen2.5-Coder-0.5B` while it reads matched pairs of correct and buggy code (Defects4J, ManySStuBs4J, or a hand-curated set of a few thousand pairs), then train the same verbalizer and reconstructor on that corpus. The falsifiable question is whether the verbalizer's English description shifts in a measurable way when the model reads the buggy variant. Specifically, do concepts like "off-by-one", "null check", "missing edge case", or "incorrect bounds" appear meaningfully more often in descriptions of buggy lines than correct ones, holding the rest of the function fixed? If yes, the NLA is a candidate fault-localisation tool, because an automated program repair system could ask the model in plain English which line looks suspicious. If no, that is informative too, because it would tell us this layer of this size of model does not carry that information at a reachable level, which constrains where future interpretability work for AI4Code should look. The setup is a straight reuse of every script in this repo with one model and one corpus swapped.
+There are no remaining low-hanging extensions — the core pipeline (warm-start, RL, layer ablation) is complete. The natural next step is a domain transfer: apply the same pipeline to a code model to ask whether the NLA bottleneck carries bug-semantic content. That extension is implemented in section 11.
+
+## 11. Code-model extension — does the NLA bottleneck detect bugs?
+
+This section applies the NLA pipeline to `Qwen2.5-Coder-0.5B` to answer a concrete research question: **does the verbalizer's English description shift in a measurable way when the model reads buggy code versus correct code?**
+
+### 11.1 Motivation
+
+If the residual stream at layer 16 encodes bug-relevant semantics, then an NLA trained on code activations should produce descriptions that mention bug-concept terms ("off-by-one", "wrong operator", "incorrect bounds") more often for buggy inputs than for correct ones. If yes, the NLA is a candidate fault-localisation signal. If no, that tells us this layer and scale do not carry that information at a reachable level — which is also a useful finding for AI4Code interpretability.
+
+### 11.2 Dataset — synthetic bug injection
+
+Rather than relying on Defects4J (Java, complex setup) or ManySStuBs4J (Java), I use a **synthetic bug corpus** built on top of CodeSearchNet Python. For each Python function, an AST transformer (`src/bug_injection.py`) injects one of four single-statement mutations:
+
+| Bug type | Example mutation |
+|---|---|
+| `off_by_one` | `< n` → `<= n`, or `range(n)` → `range(n-1)` |
+| `wrong_op` | `a + b` → `a - b` |
+| `wrong_var` | `left op right` → `right op left` |
+| `wrong_cmp` | `x == y` → `x != y` |
+
+This gives controlled, labelled pairs where the correct and buggy variants differ by exactly one token. The synthetic approach trades ecological validity for reproducibility and a clean ground-truth label — the right choice for a proof-of-concept.
+
+### 11.3 Pipeline
+
+```
+src/harvest_code_activations.py    → data/code_activations.pkl
+src/generate_code_teacher_summaries.py → data/code_teacher_summaries.pkl
+src/train_reconstructor.py         (reused unchanged, pointed at code data)
+src/train_verbalizer.py            (reused unchanged, pointed at code data)
+src/analyze_bug_descriptions.py    → results/bug_analysis.json
+```
+
+All training scripts are reused unchanged — only the data changes. The teacher for summaries is `Qwen2.5-Coder-3B-Instruct` (same 4-bit pattern as the original pipeline).
+
+Run end-to-end:
+
+```bash
+bash run_code_analysis.sh
+```
+
+### 11.4 What the analysis measures
+
+`src/analyze_bug_descriptions.py` compares verbalizer descriptions for buggy vs correct activations across three dimensions:
+
+**Keyword frequency shift.** For each term in a bug-concept vocabulary (grouped into `off_by_one`, `wrong_op`, `wrong_var`, `general_bug`, `logic`), it computes the mean hit rate in buggy descriptions minus the rate in correct descriptions. A positive shift means the verbalizer mentions that concept more often when reading buggy code.
+
+**FVE split by variant.** Reconstruction FVE is computed separately for correct and buggy activations. If the NLA represents bug-relevant information, the two FVE values may diverge.
+
+**Per-bug-type breakdown.** FVE and keyword shifts are reported per injected bug type, so you can see whether certain mutations are more "visible" to the model than others.
+
+Results are saved to `results/bug_analysis.json`.
