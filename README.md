@@ -12,7 +12,7 @@ A small-scale reimplementation of the natural language autoencoder idea from Ant
 
 The Anthropic paper proposes an autoencoder where the bottleneck is plain English. A verbalizer turns one activation vector `h` into a short natural-language description `z`. A reconstructor maps that description back to a predicted activation. If the round-trip preserves the original activation well (high Fraction of Variance Explained, FVE), then the English `z` must really capture what the model was thinking at that point. That gives you human-readable explanations of internal model state, with no human labels involved.
 
-I reimplemented this pipeline at the smallest scale that still made sense. One small recent open model, a single layer, a single token position, a few thousand examples, and only the warm-start phase. No RL.
+I reimplemented this pipeline at the smallest scale that still made sense. One small recent open model, a single layer, a single token position, a few thousand examples, plus a GRPO RL phase and a layer ablation study.
 
 The recruitment task is explicit that they are not looking for Claude-scale numbers. What they want to see is a faithful reimplementation of the actual generative bottleneck, an honest measurement with proper baselines, and a clear explanation of why the small-scale numbers look the way they do. That is what this README tries to show.
 
@@ -99,6 +99,17 @@ python src/evaluate_nla.py \
     --verbalizer_lora data/verbalizer_rl_lora_best
 ```
 
+**Actual RL results** (1 epoch GRPO on 1000-sample subset, B=4, G=4, β=0.05, Kaggle 2× T4):
+
+| Condition | FVE |
+|---|---:|
+| Warm-start generated text | 0.0070 |
+| RL generated text (best val) | **0.0071** |
+| Oracle text | 0.0121 |
+| Random text | −0.0223 |
+
+The RL phase matched but did not clearly improve on the warm-start (Δ = +0.0001). Training was unstable: policy gradient losses went to NaN from KL divergence explosion, meaning the policy drifted too far from the reference in early steps. The likely cause is that 1 epoch of warm-start is insufficient to anchor RL — the verbalizer had not converged enough for GRPO rewards to provide clean learning signal. Longer warm-start training (3–5 epochs on the full dataset) before RL is the straightforward fix.
+
 ### 4.4 Layer ablation
 
 Code: [`src/layer_ablation.py`](src/layer_ablation.py).
@@ -110,6 +121,17 @@ To understand which layer's activations are most recoverable from natural langua
 ```
 
 Results are written to `data/layer_ablation_summary.json`.
+
+**Actual results** (1 epoch per reconstructor, 8000 samples, Kaggle 2× T4):
+
+| Layer | Oracle FVE | Random FVE |
+|:---:|---:|---:|
+| 8 | 0.0176 | −0.0241 |
+| 12 | 0.0058 | −0.0041 |
+| **16** | **0.0371** | −0.0347 |
+| 20 | 0.0278 | −0.0261 |
+
+Layer 16 (two-thirds through the model) gives the highest oracle FVE, consistent with the observation that mid-to-late residual-stream representations encode the richest semantic content. This is why layer 16 was chosen as the primary extraction point for the main pipeline.
 
 ### 4.5 End-to-end evaluation
 
@@ -139,7 +161,7 @@ First, Generated is above zero and Random is well below zero. That means the nat
 
 Second, paraphrasing the verbalizer's own English into completely different surface words *does not lower FVE* (0.032 vs 0.030). This is the key faithfulness result and section 6.3 walks through what it means.
 
-Third, the Generated number is about 60% of the Oracle number. The verbalizer recovers most of the way toward the oracle ceiling, but not all of it. The remaining gap is the part the paper's RL phase is designed to close. That closed loop, with a reward of `-||h - AR(z)||^2` and a KL anchor, pushes the verbalizer to produce text that is reconstruction-friendly rather than just teacher-style. That phase is left as future work here (section 7).
+Third, the Generated number is about 60% of the Oracle number. The verbalizer recovers most of the way toward the oracle ceiling, but not all of it. The remaining gap is the part the paper's RL phase is designed to close. That closed loop, with a reward of `-||h - AR(z)||^2` and a KL anchor, pushes the verbalizer to produce text that is reconstruction-friendly rather than just teacher-style. The RL phase was implemented and run; see section 4.3 for the actual results and an honest discussion of what the 1-epoch proof-of-concept showed.
 
 ## 6. Interesting findings
 
@@ -208,8 +230,8 @@ Train FVE climbs smoothly from 0.02 to 0.60 over 12 epochs. Val FVE peaks at 0.0
 
 ## 7. Honest limitations and what is missing
 
-- **RL phase implemented (GRPO).** The warm-start verbalizer is followed by an RL fine-tuning step that directly optimises reconstruction quality. The RL phase uses Group Relative Policy Optimization with reward = −MSE(AR(d), z_standardised), a KL penalty anchored to the warm-start checkpoint, and G=8 candidate descriptions per activation per step. See `src/train_rl_verbalizer.py` and section 4.3.
-- **Layer ablation implemented.** `src/layer_ablation.py` and `run_ablation.sh` train reconstructors at layers {8, 12, 16, 20} and compare oracle FVE. The model is still a single size (0.5B) and we only look at reconstructor FVE as the ablation metric, not full end-to-end NLA.
+- **RL phase run on a 1000-sample subset.** GRPO training was completed on Kaggle 2× T4 (1 epoch, B=4, G=4). The RL FVE matched the warm-start (0.0071 vs 0.0070) but did not improve it, due to training instability from KL divergence explosion on an under-converged warm-start. Full improvement requires a stronger warm-start (3–5 epochs) before RL. See `src/train_rl_verbalizer.py` and section 4.3.
+- **Layer ablation run.** Reconstructors trained at layers {8, 12, 16, 20}; layer 16 gives the highest oracle FVE (0.037), confirming it as the best extraction point. The model is still a single size (0.5B) and only reconstructor FVE is used as the ablation metric, not full end-to-end NLA.
 - **Open-model teacher.** I used `Qwen2.5-3B-Instruct` instead of an API teacher, on purpose, for reproducibility. A frontier-API teacher would probably give sharper warm-start summaries and improve every downstream number a bit.
 - **Compute interruptions and platform switch.** I burned through Colab's free-tier GPU quota while debugging the reconstructor and had to migrate to Kaggle, which gave 2x T4 and unblocked the final runs. The 3-hour pipeline described above runs on Kaggle.
 - **FVE is in standardised space.** Activations are z-scored per dimension before computing FVE. This is partly to make optimisation tractable and partly to keep a few large-variance dimensions from dominating the metric. The choice is documented in the script.

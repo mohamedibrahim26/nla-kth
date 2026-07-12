@@ -161,10 +161,14 @@ def sequence_log_probs(model, prompt_embeds, gen_ids, gen_mask):
 
     logits        = model(inputs_embeds=full_embs,
                           attention_mask=attn_mask).logits              # (N, P+L, V)
-    rel_logits    = logits[:, P - 1 : P + L - 1, :]                   # (N, L, V)
-    log_probs_all = F.log_softmax(rel_logits, dim=-1)                  # (N, L, V)
-    token_lp      = log_probs_all.gather(
+    rel_logits    = logits[:, P - 1 : P + L - 1, :].contiguous()      # (N, L, V) – own storage
+    del logits                                                           # free (N, P+L, V) early
+    # Memory-efficient log-prob: avoid materialising (N, L, V) log_softmax output
+    sel_logits    = rel_logits.gather(
                         2, gen_ids.unsqueeze(-1)).squeeze(-1)           # (N, L)
+    log_Z         = torch.logsumexp(rel_logits, dim=-1)                 # (N, L)
+    del rel_logits                                                       # free (N, L, V) ~742 MB
+    token_lp      = sel_logits - log_Z                                  # (N, L)
     token_lp      = token_lp * gen_mask.float()                        # zero padding
     return token_lp.sum(dim=1)                                          # (N,)
 
