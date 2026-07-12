@@ -2,7 +2,7 @@
 
 A small-scale reimplementation of the natural language autoencoder idea from Anthropic's *Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations* ([transformer-circuits.pub/2026/nla](https://transformer-circuits.pub/2026/nla/index.html)). Built for the KTH ASSERT-lab PhD recruitment task with Prof. Monperrus.
 
-> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`, and then implemented the RL phase (GRPO) to close the loop. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the warm-start reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The RL phase (GRPO with group-normalised reward = reconstruction FVE) directly optimises the warm-start verbalizer against this signal and is expected to close part of the 40% gap between Generated and Oracle FVE. The numbers are small because the model is small, but the shape of the results matches the paper.
+> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`, and then implemented the RL phase (GRPO) to close the loop. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the warm-start reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The RL phase (GRPO) was implemented and run on a 1000-sample proof-of-concept subset; the actual FVE numbers and an honest discussion of training stability are in section 4.3. The numbers are small because the model is small, but the shape of the results matches the paper.
 >
 > Two qualitative findings stand out. First, when the verbalizer's English is paraphrased into completely different surface words, FVE is essentially unchanged (0.032 vs 0.030). That means the bottleneck carries genuine semantic content, not hidden token-level steganography. Second, the verbalizer keeps the theme of each snippet right while confabulating the specific entities, which is exactly what the paper reports for Claude-scale models.
 
@@ -99,7 +99,7 @@ python src/evaluate_nla.py \
     --verbalizer_lora data/verbalizer_rl_lora_best
 ```
 
-**Actual RL results** (1 epoch GRPO on 1000-sample subset, B=4, G=4, β=0.05, Kaggle 2× T4):
+**Actual RL results** (1 epoch GRPO on 1000-sample subset, B=4, G=4, β=0.05, Kaggle 2× T4 — note: these numbers are lower than section 5 because they come from a weaker 1-epoch warm-start on 1000 samples rather than the full 12-epoch run):
 
 | Condition | FVE |
 |---|---:|
