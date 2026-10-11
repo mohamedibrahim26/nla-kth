@@ -2,9 +2,9 @@
 
 A small-scale reimplementation of the natural language autoencoder idea from Anthropic's *Natural Language Autoencoders Produce Unsupervised Explanations of LLM Activations* ([transformer-circuits.pub/2026/nla](https://transformer-circuits.pub/2026/nla/index.html)). Built for the KTH ASSERT-lab PhD recruitment task with Prof. Monperrus.
 
-> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`, and then implemented the RL phase (GRPO) to close the loop. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the warm-start reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The RL phase (GRPO) was implemented and run on a 1000-sample proof-of-concept subset; the actual FVE numbers and an honest discussion of training stability are in section 4.3. The numbers are small because the model is small, but the shape of the results matches the paper.
+> **TL;DR.** I trained the two paired components from the paper, an activation verbalizer and an activation reconstructor, on `Qwen2.5-0.5B-Instruct`, and then implemented the RL phase (GRPO) to close the loop. The whole experiment ran on a free Colab T4 first, and then on Kaggle's 2x T4 after I hit Colab's daily GPU limit. On a 400-sample held-out set, the warm-start reconstructor recovers about **3.0% of the activation variance** when fed the verbalizer's own generated English, **5.0%** when fed the teacher's oracle summary, and **-6.5%** when fed random English as a negative control. The RL phase (GRPO) was implemented and run on a 1000-sample proof-of-concept subset; the actual FVE numbers and an honest discussion of training stability are in section 4.3. The numbers are small because the model is small, but the ordering of the conditions (oracle > generated > mean > random) is the one the paper reports.
 >
-> Two qualitative findings stand out. First, when the verbalizer's English is paraphrased into completely different surface words, FVE is essentially unchanged (0.032 vs 0.030). That means the bottleneck carries genuine semantic content, not hidden token-level steganography. Second, the verbalizer keeps the theme of each snippet right while confabulating the specific entities, which is exactly what the paper reports for Claude-scale models.
+> Two qualitative findings stand out. First, when the verbalizer's English is paraphrased into completely different surface words, FVE is essentially unchanged (0.032 vs 0.030). That is evidence against hidden token-level steganography: the reconstructor is reading meaning, at least at the topic level, rather than exact word choice. Second, the verbalizer keeps the theme of each snippet right while confabulating the specific entities, which is exactly what the paper reports for Claude-scale models.
 
 ---
 
@@ -68,7 +68,7 @@ After the warm-start the verbalizer has learned to *imitate* teacher summaries b
 Â_i = (R_i − mean_G(R)) / (std_G(R) + ε)
 ```
 
-This gives unbiased advantage estimates with low variance because the group shares the same input activation.
+Normalising within the group reduces variance because every candidate shares the same input activation. Dividing by the group standard deviation is a design choice, not a neutral one: it is known to bias updates towards groups with low reward spread (see Liu et al., 2025, *Understanding R1-Zero-Like Training*), and I kept it to match the original GRPO formulation.
 
 **KL penalty.** To prevent the RL policy from drifting too far from the warm-start checkpoint we add a KL penalty weighted by β=0.05:
 
@@ -188,11 +188,13 @@ Results on the 400 val activations:
 | Surface transform | FVE | Drop from original |
 |---|---:|---:|
 | Original generated text | 0.0303 | - |
-| Paraphrased by teacher (meaning preserved) | 0.0315 | **+1%** |
+| Paraphrased by teacher (meaning preserved) | 0.0315 | **+4%** |
 | Sentence-shuffled | 0.0301 | -1% |
 | Word-shuffled (grammar destroyed) | 0.0247 | -18% |
 
-Paraphrasing did not just preserve FVE, it nudged it very slightly higher. Word-shuffle, in contrast, drops FVE 18%, which confirms the metric *is* sensitive to text structure and the paraphrase-preservation is not an artifact. The bottleneck is genuinely semantic.
+Paraphrasing did not just preserve FVE, it nudged it very slightly higher. Word-shuffle, in contrast, drops FVE 18%, which shows the metric *is* sensitive to text structure, so the paraphrase result is not just an insensitive metric.
+
+Two caveats on how far this goes. First, word-shuffled text still keeps about 82% of the FVE, so most of what the reconstructor uses survives as a bag of words. The bottleneck looks *topic-level semantic* (which concepts are mentioned) more than *compositional* (how they are put together). Second, the paraphrases were written by the same teacher model whose summaries the reconstructor was trained on, which may explain the small increase. Differences of 0.001 to 0.002 FVE on 400 samples are also within the range I would expect from noise; I have not computed bootstrap confidence intervals yet.
 
 This is also what separates a healthy small-scale NLA from one that has mode-collapsed during training. The paper points to this kind of degenerate behavior as a real risk at small scale and as something to test for explicitly; the paraphrase test is the cleanest direct check.
 
@@ -278,7 +280,7 @@ results/
   paraphrase_samples.csv          - original / paraphrased / shuffled side by side
   plots/fve_bar.png               - all-condition FVE bar chart (section 5)
   plots/reconstructor_curve.png   - reconstructor training curve (section 6.5)
-  bug_analysis.json               - keyword shift + FVE results for code extension (section 11)
+  bug_analysis.json               - (not yet produced) keyword shift + FVE results for code extension (section 11)
 ```
 
 End-to-end reproduction (on Kaggle, 2x T4, about 3 hours total):
@@ -307,9 +309,11 @@ Everything else (`--lr`, `--lora_r`, `--max_len`, and so on) is exposed as a CLI
 
 ## 10. What I would do next with more time
 
-The most natural extension is applying this pipeline to a code model to ask whether the NLA bottleneck carries bug-semantic content. That work is fully implemented in section 11. Beyond that, the highest-impact remaining improvements would be: using a frontier API teacher rather than Qwen2.5-3B for sharper warm-start summaries, running more GRPO steps to further close the Generated-to-Oracle FVE gap, and repeating the layer ablation across multiple model sizes to understand how scale and depth interact with the quality of the bottleneck.
+The most natural extension is applying this pipeline to a code model to ask whether the NLA bottleneck carries bug-semantic content. That pipeline is implemented in section 11 but has not been run yet, so there are no results for it. Beyond that, the highest-impact remaining improvements would be: using a frontier API teacher rather than Qwen2.5-3B for sharper warm-start summaries, running more GRPO steps to further close the Generated-to-Oracle FVE gap, and repeating the layer ablation across multiple model sizes to understand how scale and depth interact with the quality of the bottleneck.
 
 ## 11. Code-model extension: does the NLA bottleneck detect bugs?
+
+> **Status: implemented, not yet run.** The scripts below are complete, but the code-model pipeline has not been trained or evaluated yet, so this section describes the method only. `results/bug_analysis.json` does not exist yet.
 
 This section applies the NLA pipeline to `Qwen2.5-Coder-0.5B` to answer a concrete research question: **does the verbalizer's English description shift in a measurable way when the model reads buggy code versus correct code?**
 
@@ -325,10 +329,10 @@ Rather than relying on Defects4J (Java, complex setup) or ManySStuBs4J (Java), I
 |---|---|
 | `off_by_one` | `< n` → `<= n`, or `range(n)` → `range(n-1)` |
 | `wrong_op` | `a + b` → `a - b` |
-| `wrong_var` | `left op right` → `right op left` |
+| `wrong_var` | swap two variable names inside an expression, e.g. `a - b` → `b - a` |
 | `wrong_cmp` | `x == y` → `x != y` |
 
-This gives controlled, labelled pairs where the correct and buggy variants differ by exactly one token. The synthetic approach trades ecological validity for reproducibility and a clean ground-truth label — the right choice for a proof-of-concept.
+This gives controlled, labelled pairs where the correct and buggy variants differ by a single small edit at one known line. The synthetic approach trades ecological validity for reproducibility and a clean ground-truth label — the right choice for a proof-of-concept.
 
 ### 11.3 Pipeline
 
@@ -358,4 +362,4 @@ bash run_code_analysis.sh
 
 **Per-bug-type breakdown.** FVE and keyword shifts are reported per injected bug type, so you can see whether certain mutations are more "visible" to the model than others.
 
-Results are saved to `results/bug_analysis.json`.
+Results will be saved to `results/bug_analysis.json` once the pipeline has been run.
